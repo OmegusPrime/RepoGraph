@@ -49,19 +49,63 @@ def iter_source_files(root: Path) -> Iterable[Path]:
                     continue
 
 
-def git_info(root: Path) -> dict:
-    def run(*args: str) -> str:
-        try:
-            return subprocess.check_output(
-                ["git", "-C", str(root), *args], stderr=subprocess.DEVNULL, text=True,
-                timeout=5,
-            ).strip()
-        except Exception:
+def git_run(root: Path, *args: str, check: bool = True):
+    """Run Git. By default return stdout; with check=False return CompletedProcess."""
+    try:
+        p = subprocess.run(
+            ["git", "-C", str(Path(root).resolve()), *args],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30,
+        )
+    except Exception:
+        if check:
             return ""
+        return subprocess.CompletedProcess(args, 1, "", "git invocation failed")
+    if check:
+        return p.stdout.strip() if p.returncode == 0 else ""
+    p.stdout = p.stdout.strip()
+    p.stderr = p.stderr.strip()
+    return p
 
-    branch = run("rev-parse", "--abbrev-ref", "HEAD")
-    commit = run("rev-parse", "HEAD")
-    status = run("status", "--porcelain=v1")
+
+def is_git_repository(path: Path) -> bool:
+    return bool(git_run(path, "rev-parse", "--show-toplevel"))
+
+
+def discover_git_repositories(root: Path, max_depth: int = 4) -> list[Path]:
+    """Find Git repositories below root, preferring real workspaces over nested vendor/worktree data."""
+    root = Path(root).resolve()
+    top = git_run(root, "rev-parse", "--show-toplevel")
+    if top:
+        top_path = Path(top).resolve()
+        # If root is inside a repository, that repository owns the workspace.
+        if root == top_path or top_path in root.parents:
+            return [top_path]
+    found: list[Path] = []
+    for base, dirs, _files in os.walk(root):
+        b = Path(base)
+        try:
+            depth = len(b.relative_to(root).parts)
+        except ValueError:
+            continue
+        if (b / ".git").exists():
+            if git_run(b, "rev-parse", "--show-toplevel"):
+                found.append(b.resolve())
+            dirs[:] = [d for d in dirs if d != ".git"]
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS and d != "worktrees"]
+        if depth >= max_depth:
+            dirs[:] = []
+    # Deduplicate while keeping deterministic paths.
+    unique = sorted({p for p in found}, key=lambda p: p.as_posix().lower())
+    return unique
+
+
+def git_info(root: Path) -> dict:
+    branch = git_run(root, "rev-parse", "--abbrev-ref", "HEAD")
+    commit = git_run(root, "rev-parse", "HEAD")
+    status = git_run(root, "status", "--porcelain=v1")
     changed = []
     for line in status.splitlines():
         if len(line) >= 4:

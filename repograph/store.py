@@ -25,6 +25,8 @@ CREATE TABLE IF NOT EXISTS nodes (
 CREATE INDEX IF NOT EXISTS idx_nodes_name ON nodes(name);
 CREATE INDEX IF NOT EXISTS idx_nodes_path ON nodes(path);
 CREATE INDEX IF NOT EXISTS idx_nodes_kind ON nodes(kind);
+CREATE INDEX IF NOT EXISTS idx_nodes_repo ON nodes(repo);
+CREATE INDEX IF NOT EXISTS idx_nodes_repo_path ON nodes(repo, path);
 CREATE TABLE IF NOT EXISTS edges (
     src TEXT NOT NULL,
     dst TEXT NOT NULL,
@@ -44,6 +46,7 @@ CREATE TABLE IF NOT EXISTS files (
     size INTEGER NOT NULL,
     PRIMARY KEY (repo, path)
 );
+CREATE INDEX IF NOT EXISTS idx_files_repo ON files(repo);
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -95,21 +98,30 @@ class GraphStore:
             return con.execute("SELECT * FROM files WHERE repo=? AND path=?", (repo, path)).fetchone()
 
     def remove_file(self, repo: str, path: str) -> None:
+        # Delete by subquery instead of materializing every node id into SQL
+        # placeholders. A single source file can contain thousands of symbols;
+        # enumerating those ids can exceed SQLite's variable limit.
         with self.connect() as con:
-            ids = [r[0] for r in con.execute("SELECT id FROM nodes WHERE repo=? AND path=?", (repo, path)).fetchall()]
-            if ids:
-                marks = ",".join("?" for _ in ids)
-                con.execute(f"DELETE FROM edges WHERE src IN ({marks}) OR dst IN ({marks})", (*ids, *ids))
-                con.execute(f"DELETE FROM nodes WHERE id IN ({marks})", ids)
+            con.execute(
+                """DELETE FROM edges
+                   WHERE src IN (SELECT id FROM nodes WHERE repo=? AND path=?)
+                      OR dst IN (SELECT id FROM nodes WHERE repo=? AND path=?)""",
+                (repo, path, repo, path),
+            )
+            con.execute("DELETE FROM nodes WHERE repo=? AND path=?", (repo, path))
             con.execute("DELETE FROM files WHERE repo=? AND path=?", (repo, path))
 
     def replace_file_graph(self, repo: str, path: str, nodes: list[dict], edges: list[dict]) -> None:
         with self.connect() as con:
-            old = [r[0] for r in con.execute("SELECT id FROM nodes WHERE repo=? AND path=?", (repo, path)).fetchall()]
-            if old:
-                marks = ",".join("?" for _ in old)
-                con.execute(f"DELETE FROM edges WHERE src IN ({marks}) OR dst IN ({marks})", (*old, *old))
-                con.execute(f"DELETE FROM nodes WHERE id IN ({marks})", old)
+            # Keep cleanup bounded to four SQL parameters regardless of how
+            # many symbols the old file graph contains.
+            con.execute(
+                """DELETE FROM edges
+                   WHERE src IN (SELECT id FROM nodes WHERE repo=? AND path=?)
+                      OR dst IN (SELECT id FROM nodes WHERE repo=? AND path=?)""",
+                (repo, path, repo, path),
+            )
+            con.execute("DELETE FROM nodes WHERE repo=? AND path=?", (repo, path))
             for n in nodes:
                 con.execute("""INSERT OR REPLACE INTO nodes
                     (id,repo,kind,name,path,line,lang,signature,content_hash,metadata_json)
@@ -126,9 +138,91 @@ class GraphStore:
                 con.execute("INSERT OR REPLACE INTO edges(src,dst,kind,weight,metadata_json) VALUES(?,?,?,?,?)",
                             (e["src"], e["dst"], e["kind"], e.get("weight",1.0), json.dumps(e.get("metadata",{}), sort_keys=True)))
 
+    def replace_repo_nodes_by_kind(self, repo: str, kind: str, nodes: list[dict], edges: list[dict]) -> None:
+        """Atomically replace a repository-scoped derived architecture subgraph."""
+        with self.connect() as con:
+            con.execute(
+                """DELETE FROM edges
+                   WHERE src IN (SELECT id FROM nodes WHERE repo=? AND kind=?)
+                      OR dst IN (SELECT id FROM nodes WHERE repo=? AND kind=?)""",
+                (repo, kind, repo, kind),
+            )
+            con.execute("DELETE FROM nodes WHERE repo=? AND kind=?", (repo, kind))
+            for n in nodes:
+                con.execute(
+                    """INSERT OR REPLACE INTO nodes
+                    (id,repo,kind,name,path,line,lang,signature,content_hash,metadata_json)
+                    VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        n["id"], repo, n["kind"], n["name"], n.get("path", ""), n.get("line", 1),
+                        n.get("lang", ""), n.get("signature", ""), n.get("content_hash", ""),
+                        json.dumps(n.get("metadata", {}), sort_keys=True),
+                    ),
+                )
+            for e in edges:
+                con.execute(
+                    "INSERT OR REPLACE INTO edges(src,dst,kind,weight,metadata_json) VALUES(?,?,?,?,?)",
+                    (e["src"], e["dst"], e["kind"], e.get("weight", 1.0), json.dumps(e.get("metadata", {}), sort_keys=True)),
+                )
+
     def clear_edge_kind(self, kind: str) -> None:
         with self.connect() as con:
             con.execute("DELETE FROM edges WHERE kind=?", (kind,))
+
+
+    def clear_edge_kind_for_repo(self, kind: str, repo: str) -> None:
+        with self.connect() as con:
+            con.execute("DELETE FROM edges WHERE kind=? AND src IN (SELECT id FROM nodes WHERE repo=?)", (kind, repo))
+
+    def repositories(self) -> list[str]:
+        with self.connect() as con:
+            rows = con.execute("SELECT DISTINCT repo FROM nodes UNION SELECT DISTINCT repo FROM files ORDER BY repo").fetchall()
+        return [r[0] for r in rows]
+
+    def remove_repo(self, repo: str) -> None:
+        # Never expand repository node ids into an IN (?, ?, ...) list. Large
+        # repositories easily exceed SQLite's SQLITE_LIMIT_VARIABLE_NUMBER.
+        # Let SQLite resolve the ids internally so this stays constant-size.
+        with self.connect() as con:
+            con.execute(
+                """DELETE FROM edges
+                   WHERE src IN (SELECT id FROM nodes WHERE repo=?)
+                      OR dst IN (SELECT id FROM nodes WHERE repo=?)""",
+                (repo, repo),
+            )
+            con.execute("DELETE FROM nodes WHERE repo=?", (repo,))
+            con.execute("DELETE FROM files WHERE repo=?", (repo,))
+
+    def repo_stats(self) -> list[dict]:
+        with self.connect() as con:
+            rows = con.execute("""
+                SELECT r.repo,
+                       (SELECT COUNT(*) FROM files f WHERE f.repo=r.repo) AS files,
+                       (SELECT COUNT(*) FROM nodes n WHERE n.repo=r.repo) AS nodes,
+                       (SELECT COUNT(*) FROM edges e JOIN nodes n2 ON n2.id=e.src WHERE n2.repo=r.repo) AS edges
+                FROM (SELECT DISTINCT repo FROM nodes UNION SELECT DISTINCT repo FROM files) r
+                ORDER BY r.repo
+            """).fetchall()
+        return [dict(r) for r in rows]
+
+    def top_nodes(self, limit: int = 80, repo: str | None = None) -> list[dict]:
+        params = []
+        where = "WHERE n.kind <> 'file'"
+        if repo is not None:
+            where += " AND n.repo=?"
+            params.append(repo)
+        params.append(limit)
+        with self.connect() as con:
+            rows = con.execute(f"""
+                SELECT n.*,
+                       ((SELECT COUNT(*) FROM edges e WHERE e.src=n.id) +
+                        (SELECT COUNT(*) FROM edges e WHERE e.dst=n.id)) AS degree
+                FROM nodes n
+                {where}
+                ORDER BY degree DESC, n.repo, n.path, n.line
+                LIMIT ?
+            """, params).fetchall()
+        return [dict(r) for r in rows]
 
     def log_event(self, event_type: str, path: str, details: dict | None = None) -> None:
         with self.connect() as con:
@@ -143,12 +237,17 @@ class GraphStore:
             edge_kinds = {r[0]: r[1] for r in con.execute("SELECT kind,COUNT(*) FROM edges GROUP BY kind ORDER BY COUNT(*) DESC")}
         return {"nodes": nodes, "edges": edges, "files": files, "node_kinds": kinds, "edge_kinds": edge_kinds}
 
-    def search(self, query: str, limit: int = 30) -> list[dict]:
+    def search(self, query: str, limit: int = 30, repo: str | None = None) -> list[dict]:
         q = f"%{query}%"
+        where = "(name LIKE ? OR path LIKE ? OR signature LIKE ?)"
+        params: list = [q, q, q]
+        if repo:
+            where += " AND repo=?"
+            params.append(repo)
+        params.extend([query, f"{query}%", limit])
         with self.connect() as con:
-            rows = con.execute("""SELECT * FROM nodes WHERE name LIKE ? OR path LIKE ? OR signature LIKE ?
-                                  ORDER BY CASE WHEN name=? THEN 0 WHEN name LIKE ? THEN 1 ELSE 2 END, kind, path, line LIMIT ?""",
-                               (q,q,q,query,f"{query}%",limit)).fetchall()
+            rows = con.execute(f"""SELECT * FROM nodes WHERE {where}
+                                  ORDER BY CASE WHEN name=? THEN 0 WHEN name LIKE ? THEN 1 ELSE 2 END, kind, repo, path, line LIMIT ?""", params).fetchall()
         return [dict(r) for r in rows]
 
     def node(self, node_id: str):
@@ -156,12 +255,16 @@ class GraphStore:
             r = con.execute("SELECT * FROM nodes WHERE id=?", (node_id,)).fetchone()
         return dict(r) if r else None
 
-    def resolve(self, target: str) -> list[dict]:
+    def resolve(self, target: str, repo: str | None = None) -> list[dict]:
+        where = "(id=? OR name=? OR path=?)"
+        params: list = [target, target, target]
+        if repo:
+            where += " AND repo=?"; params.append(repo)
         with self.connect() as con:
-            exact = con.execute("SELECT * FROM nodes WHERE id=? OR name=? OR path=? ORDER BY kind", (target,target,target)).fetchall()
+            exact = con.execute(f"SELECT * FROM nodes WHERE {where} ORDER BY kind,repo,path,line", params).fetchall()
         if exact:
             return [dict(r) for r in exact]
-        return self.search(target, limit=10)
+        return self.search(target, limit=10, repo=repo)
 
     def neighbors(self, node_id: str, direction: str = "both") -> list[dict]:
         sql = []
@@ -180,7 +283,13 @@ class GraphStore:
 
     def graph_slice(self, limit: int = 250) -> dict:
         with self.connect() as con:
-            nodes = [dict(r) for r in con.execute("SELECT * FROM nodes ORDER BY kind,path,line LIMIT ?", (limit,)).fetchall()]
+            nodes = [dict(r) for r in con.execute(
+                """SELECT * FROM nodes
+                   ORDER BY CASE kind WHEN 'maven_module' THEN 0 WHEN 'file' THEN 2 ELSE 1 END,
+                            repo,path,line
+                   LIMIT ?""",
+                (limit,),
+            ).fetchall()]
             ids = {n["id"] for n in nodes}
             if ids:
                 marks = ",".join("?" for _ in ids)
